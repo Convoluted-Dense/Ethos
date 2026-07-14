@@ -1,0 +1,43 @@
+IGNORED FILES & LOCAL BACKUPS
+=============================
+
+The following files and directories are excluded from the repository tracking via `.gitignore` to keep the repository lightweight. They remain stored locally on your machine at the specified paths.
+
+1. Datasets & Media Files
+-------------------------
+*   **dataset/**
+    *   Description: The raw image dataset, map captures, and `telemetry.csv` containing steering labels.
+    *   Local Path: `C:\Golden Buggy\dataset\`
+*   **try/diffusers_output/**
+    *   Description: 1,800+ Stable Diffusion generated dashcam JPEG frames.
+    *   Local Path: `C:\Golden Buggy\try\diffusers_output\`
+*   **test.mp4**
+    *   Description: Original BeamNG gameplay capture.
+    *   Local Path: `C:\Golden Buggy\test.mp4`
+*   **try/*.mp4** (e.g., final_fast_snowy.mp4, final_snowy_dashcam.mp4, test2.mp4)
+    *   Description: Output compiled video files from diffusion scripts.
+    *   Local Path: `C:\Golden Buggy\try\`
+
+2. Trained Model Checkpoints
+----------------------------
+*   **best_steering_velocity_model.pth**
+    *   Description: The trained PilotNet / PyTorch steering model checkpoint.
+    *   Local Path: `C:\Golden Buggy\best_steering_velocity_model.pth`
+
+3. Large Code Dependencies
+--------------------------
+*   **try/stable-diffusion-webui-forge/**
+    *   Description: The cloned Stable Diffusion WebUI Forge repository.
+    *   Local Path: `C:\Golden Buggy\try\stable-diffusion-webui-forge\`
+*   **.venv/**
+    *   Description: Python virtual environment containing packages (numpy, opencv, torch, etc.).
+    *   Local Path: `C:\Golden Buggy\.venv\`
+
+4. Logs & Cache Caches
+----------------------
+*   **wandb/**
+    *   Description: Local logging metadata and weights & biases logs.
+    *   Local Path: `C:\Golden Buggy\wandb\`
+*   **__pycache__/**
+    *   Description: Python compilation cache.
+    *   Local Path: `C:\Golden Buggy\__pycache__\`
