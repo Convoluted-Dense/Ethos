@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large files / Datasets
+dataset/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Models and checkpoints
+*.pth
+*.pt
+*.onnx
+models/
+
+# Tracking and logging
+try/stable-diffusion-webui-forge/
+wandb/
+.system_generated/
+.gemini/
+.agents/
+*.log
