@@ -10,6 +10,7 @@ __pycache__/
 
 # Large files / Datasets
 dataset/
+try/diffusers_output/
 *.mp4
 *.avi
 *.mov
