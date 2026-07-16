@@ -1,0 +1,10 @@
+{
+  "max_speed": 22.682999073309354,
+  "version": 3,
+  "outputs": [
+    "steering",
+    "scaled_speed",
+    "lateral_offset"
+  ],
+  "arch": "dual_stream_efficientnet_b1"
+}

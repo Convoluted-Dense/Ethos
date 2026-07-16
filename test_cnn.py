@@ -58,6 +58,32 @@ class RegressionTarget:
     def __call__(self, model_output):
         return model_output[self.target_idx]
 
+class ActivationTracker:
+    """
+    Hooks into key MBConv feature stages of the EfficientNet model to capture
+    the activation maps during the forward pass.
+    """
+    def __init__(self, model):
+        self.activations = {}
+        self.hooks = []
+        self.stages = {
+            "Stage 1 (Early Edges)": model.model.features[1],
+            "Stage 3 (Textures)": model.model.features[3],
+            "Stage 5 (Mid-Late Shapes)": model.model.features[5],
+            "Stage 7 (High Semantics)": model.model.features[7]
+        }
+        for name, layer in self.stages.items():
+            self.hooks.append(layer.register_forward_hook(self._make_hook(name)))
+
+    def _make_hook(self, name):
+        def hook(module, input, output):
+            self.activations[name] = output.detach()
+        return hook
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+
 # ---------------------------------------------------------------------------
 # vJoy constants
 # ---------------------------------------------------------------------------
@@ -366,6 +392,8 @@ def make_parser():
                         "If omitted, auto-loaded from <model>_meta.json (recommended).")
     p.add_argument("--cam",       action="store_true",
                    help="enable Grad-CAM visualization for debugging")
+    p.add_argument("--activations", action="store_true",
+                   help="enable activation map visualization for each convolution stage")
     p.add_argument("--headless",  action="store_true",
                    help="run without displaying the OpenCV window")
     p.add_argument("--no-vjoy",   action="store_true",
@@ -443,6 +471,12 @@ def main():
             cam = GradCAM(model=model, target_layers=target_layers)
             print("[init] Grad-CAM enabled for steering prediction.")
 
+    # ── Activation Tracker setup ──────────────────────────────────────────
+    act_tracker = None
+    if opt.activations:
+        act_tracker = ActivationTracker(model)
+        print("[init] Activation map visualization enabled.")
+
     # ── vJoy setup ─────────────────────────────────────────────────────────
     vjoy = None
     if not opt.no_vjoy:
@@ -491,37 +525,17 @@ def main():
     else:
         print("\n[inference] Running — press Q or ESC in the HUD window to stop.\n")
 
-    # ── Fast mss capture setup ──────────────────────────────────────────
-    # mss reads directly from the GPU framebuffer, 3-5x faster than PrintWindow.
-    # Requires the game to be in borderless/windowed mode (visible on screen).
-    sct     = mss.MSS()
-    monitor = get_window_rect(hwnd)
-    if monitor:
-        print(f"[init] mss capture: window at {monitor} (fast path)")
-    else:
-        print("[warn] Could not get window rect — falling back to PrintWindow")
-
     try:
         while True:
             t0 = time.perf_counter()
 
             # 1. Capture frame ------------------------------------------------
             t_cap_start = time.perf_counter()
-            # Use fast mss capture if monitor rect is known, else fall back.
-            if monitor:
-                raw = capture_mss(sct, monitor)
-            else:
-                raw = capture_printwindow(hwnd)
+            raw = capture_printwindow(hwnd)
             if raw is None:
                 time.sleep(0.01)
                 continue
             t_cap = time.perf_counter() - t_cap_start
-
-            # Refresh window rect every 300 frames in case the window moved
-            if fps_frames % 300 == 0:
-                new_rect = get_window_rect(hwnd)
-                if new_rect:
-                    monitor = new_rect
 
             # 2. Preprocess ---------------------------------------------------
             t_prep_start = time.perf_counter()
@@ -543,12 +557,50 @@ def main():
                 img_float = img_unnorm[0].permute(1, 2, 0).detach().cpu().numpy()
                 img_float = np.clip(img_float, 0, 1)
                 
-                # Overlay CAM on the 240x240 model input
-                cam_view = show_cam_on_image(img_float, grayscale_cam, use_rgb=False)
+                # Convert RGB to BGR so it displays correctly in OpenCV
+                img_bgr = img_float[:, :, ::-1]
                 
-                # Scale up slightly for easier viewing and show in a separate window
-                cam_view_large = cv2.resize(cam_view, (480, 480))
+                # Overlay CAM on the BGR image (use_rgb=False specifies BGR input/output)
+                cam_view = show_cam_on_image(img_bgr, grayscale_cam, use_rgb=False)
+                
+                # Scale up and stretch back to original crop aspect ratio for natural viewing
+                cam_view_large = cv2.resize(cam_view, (960, 198))
                 cv2.imshow("Model View (Grad-CAM)", cam_view_large)
+            elif act_tracker is not None:
+                # Run standard forward pass to trigger hooks
+                out = model(tensor)
+                
+                # Extract and process feature activations for display
+                stages_to_show = ["Stage 1 (Early Edges)", "Stage 3 (Textures)", "Stage 5 (Mid-Late Shapes)", "Stage 7 (High Semantics)"]
+                activation_maps = []
+                for stage_name in stages_to_show:
+                    feat = act_tracker.activations.get(stage_name)
+                    if feat is not None:
+                        # L2 Norm across all channels to represent overall activation magnitude at each spatial location
+                        # Shape: [1, channels, H, W] -> [H, W]
+                        act = torch.norm(feat[0], p=2, dim=0).cpu().numpy()
+                        
+                        # Min-max normalization
+                        act_min, act_max = act.min(), act.max()
+                        if act_max > act_min:
+                            act = (act - act_min) / (act_max - act_min)
+                        else:
+                            act = np.zeros_like(act)
+                        act = (act * 255).astype(np.uint8)
+                        
+                        # Colorize using cv2 JET colormap
+                        color_act = cv2.applyColorMap(act, cv2.COLORMAP_JET)
+                        
+                        # Resize to uniform 240x240 and add text tag
+                        color_act = cv2.resize(color_act, (240, 240))
+                        cv2.putText(color_act, stage_name, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                        
+                        activation_maps.append(color_act)
+                
+                if activation_maps:
+                    # Stitch horizontally into a single image strip (960 x 240)
+                    combined_strip = np.hstack(activation_maps)
+                    cv2.imshow("Model Activations (Edges -> Shapes -> Semantics)", combined_strip)
             else:
                 with torch.inference_mode():
                     if device.type == "cuda":
@@ -623,12 +675,17 @@ def main():
                 # If cam is active in headless, we still need waitKey to render the cam window
                 if cam is not None:
                     cv2.waitKey(1)
+                elif act_tracker is not None:
+                    cv2.waitKey(1)
                 else:
                     time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nStopped by Ctrl-C.")
     finally:
+        # Clean up hooks
+        if act_tracker is not None:
+            act_tracker.remove()
         # Safe: centre steering and zero throttle before exit
         if vjoy_sender is not None:
             vjoy_sender.stop(centre=True)

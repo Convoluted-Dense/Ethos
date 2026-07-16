@@ -191,15 +191,11 @@ class SteeringVelocityDataset(Dataset):
         # Resize for EfficientNet B1
         img = TF.resize(img, (240, 240))
         
-        is_flipped = False
         if self.split == 'train':
             if random.random() > 0.5:
                 img = self.color_jitter(img)
             if random.random() > 0.5:
                 img = self.blur(img)
-            if random.random() > 0.5:
-                img = TF.hflip(img)
-                is_flipped = True
                 
         img_tensor = TF.to_tensor(img)
         
@@ -227,10 +223,7 @@ class SteeringVelocityDataset(Dataset):
         velX = float(row['velX'])
         velY = float(row['velY'])
         
-        # Flip steering if image was horizontally flipped
-        if is_flipped:
-            steering = -steering
-            
+        
         # Speed scaling based on dynamically calculated max speed
         speed = math.sqrt(velX**2 + velY**2)
         scaled_speed = speed / self.max_speed

@@ -416,9 +416,11 @@ class DatasetWriter:
         self.map_dir.mkdir(parents=True, exist_ok=True)
 
         csv_path = out_dir / "telemetry.csv"
-        self._csv_fh = open(csv_path, "w", newline="", encoding="utf-8")
+        file_exists = csv_path.exists()
+        self._csv_fh = open(csv_path, "a", newline="", encoding="utf-8")
         self._writer  = csv.DictWriter(self._csv_fh, fieldnames=CSV_HEADER)
-        self._writer.writeheader()
+        if not file_exists:
+            self._writer.writeheader()
         self._csv_fh.flush()
 
         print(f"[writer] Images  -> {self.img_dir}")
@@ -688,8 +690,8 @@ def main():
             # 7. Write to disk (steering = raw steering, steering_combined = raw + offset)
             writer.write(frame_name, raw, map_img, capture_time, telem, steering=steering, steering_offset=offset, steering_combined=final_steering)
             saved += 1
-            if saved >= 100000:
-                print(f"\n[collect] Limit of 100,000 images (1 lakh) reached! Stopping collection...")
+            if saved >= 50000:
+                print(f"\n[collect] Limit of 50,000 images reached! Stopping collection...")
                 break
 
             # 7. FPS counter
