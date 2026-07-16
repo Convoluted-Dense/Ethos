@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EthosDit Annotation</title>
+    <!-- Modern Sans-serif font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0a0c;
+            --glass-bg: rgba(20, 20, 25, 0.6);
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --accent-green: #00e676;
+            --accent-red: #ff3d00;
+            --accent-blue: #2979ff;
+            --accent-yellow: #ffea00;
+            --text-main: #f0f0f0;
+            --text-muted: #888890;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        /* Glassmorphism Panel Utility */
+        .glass {
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+        }
+
+        /* Top Bar */
+        #top-bar {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 90%;
+            max-width: 1200px;
+            padding: 12px 24px;
+            z-index: 100;
+        }
+
+        .stat-group {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+
+        .stat {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .stat-label {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin-bottom: 2px;
+        }
+        
+        .stat-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+        }
+
+        /* Main Image Viewer */
+        #viewer-container {
+            position: relative;
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 80px 20px 60px 20px;
+        }
+
+        #image-frame {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 8px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            transition: border 0.1s ease;
+            border: 4px solid transparent;
+        }
+
+        /* Overlays */
+        #intersection-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            border: 8px solid var(--accent-red);
+            border-radius: 8px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.1s ease;
+            box-shadow: inset 0 0 40px rgba(255, 61, 0, 0.5);
+            z-index: 50;
+        }
+
+        #intersection-overlay.active {
+            opacity: 1;
+        }
+
+        #steering-bar {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80%;
+            max-width: 800px;
+            height: 12px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+            z-index: 60;
+        }
+
+        #steering-indicator {
+            height: 100%;
+            width: 100%;
+            transition: background-color 0.2s ease, transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            transform-origin: center;
+        }
+
+        .dir-left { background: var(--accent-red); transform: scaleX(1) translateX(-25%); }
+        .dir-straight { background: var(--accent-green); transform: scaleX(1) translateX(0); }
+        .dir-right { background: var(--accent-blue); transform: scaleX(1) translateX(25%); }
+
+        /* Floating status pills */
+        #steering-text {
+            position: absolute;
+            bottom: 45px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            letter-spacing: 1px;
+            z-index: 60;
+            transition: all 0.2s ease;
+        }
+
+        /* Keyboard legend */
+        #legend {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 1200px;
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            padding: 12px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            z-index: 100;
+        }
+
+        .key {
+            background: rgba(255,255,255,0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #fff;
+            font-family: monospace;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 2px 0 rgba(0,0,0,0.5);
+        }
+
+        /* Toast notifications */
+        #toast-container {
+            position: absolute;
+            top: 90px;
+            right: 5%;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 200;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            font-size: 0.9rem;
+            animation: slideIn 0.3s ease forwards, fadeOut 0.3s ease 2s forwards;
+            border-left: 4px solid var(--accent-blue);
+        }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="top-bar" class="glass">
+        <div class="stat-group">
+            <div class="stat">
+                <span class="stat-label">Play State</span>
+                <span class="stat-value" id="val-play" style="color: var(--accent-yellow);">PLAYING</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">FPS Control</span>
+                <span class="stat-value" id="val-fps">10 FPS</span>
+            </div>
+        </div>
+        <div class="stat-group">
+            <div class="stat">
+                <span class="stat-label">Frame</span>
+                <span class="stat-value" id="val-frame">0 / 0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Batch ID</span>
+                <span class="stat-value" id="val-batch">0</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <div id="viewer-container">
+        <!-- Overlay container fits exact image dimensions in JS -->
+        <div id="image-wrapper" style="position: relative; display: inline-block; max-width: 100%; max-height: 100%;">
+            <img id="image-frame" src="" alt="Dataset Frame">
+            <div id="intersection-overlay"></div>
+            <div id="steering-text" class="glass">STRAIGHT</div>
+            <div id="steering-bar">
+                <div id="steering-indicator" class="dir-straight"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="legend" class="glass">
+        <span><span class="key">Space</span> Play/Pause</span>
+        <span><span class="key">W</span> / <span class="key">S</span> Speed</span>
+        <span><span class="key">←</span> / <span class="key">→</span> (Hold) Steer</span>
+        <span><span class="key">I</span> Intersection</span>
+        <span><span class="key">F</span> Del Batch</span>
+        <span><span class="key">`</span> Undo</span>
+        <span><span class="key">Bksp</span> Back</span>
+        <span><span class="key">Enter</span> Save</span>
+    </div>
+
+    <script>
+        // State
+        let frames = [];
+        let currentIndex = 0;
+        let playing = true;
+        let fps = 10;
+        let framesVisited = 0;
+        let lastDrawTime = 0;
+
+        // Key states
+        let leftHeld = false;
+        let rightHeld = false;
+        
+        // DOM Elements
+        const elImage = document.getElementById('image-frame');
+        const elPlay = document.getElementById('val-play');
+        const elFps = document.getElementById('val-fps');
+        const elFrame = document.getElementById('val-frame');
+        const elBatch = document.getElementById('val-batch');
+        const elIntersection = document.getElementById('intersection-overlay');
+        const elSteerIndicator = document.getElementById('steering-indicator');
+        const elSteerText = document.getElementById('steering-text');
+        const elToastContainer = document.getElementById('toast-container');
+
+        // Initialization
+        async function init() {
+            try {
+                const res = await fetch('/api/init');
+                const data = await res.json();
+                frames = data.frames;
+                fps = data.fps;
+                
+                if (frames.length > 0) {
+                    requestAnimationFrame(playbackLoop);
+                } else {
+                    showToast("No frames found!", "error");
+                }
+            } catch (err) {
+                console.error("Init error", err);
+                showToast("Connection error", "error");
+            }
+        }
+
+        // Main Loop
+        function playbackLoop(timestamp) {
+            if (playing && frames.length > 0) {
+                const delay = 1000 / fps;
+                if (timestamp - lastDrawTime >= delay) {
+                    lastDrawTime = timestamp;
+                    renderCurrentFrame();
+                    currentIndex = (currentIndex + 1) % frames.length;
+                    
+                    framesVisited++;
+                    if (framesVisited % 500 === 0) {
+                        saveData(true);
+                    }
+                }
+            }
+            requestAnimationFrame(playbackLoop);
+        }
+
+        // Render Frame Data to UI
+        function renderCurrentFrame() {
+            if (frames.length === 0) {
+                elImage.src = "";
+                return;
+            }
+            const idx = Math.max(0, Math.min(currentIndex, frames.length - 1));
+            const frame = frames[idx];
+            
+            // Image
+            elImage.src = `/image/${frame.frame}`;
+            
+            // Top Bar
+            elPlay.innerText = playing ? "PLAYING" : "PAUSED";
+            elPlay.style.color = playing ? "var(--accent-green)" : "var(--accent-yellow)";
+            elFps.innerText = `${fps} FPS`;
+            elFrame.innerText = `${idx + 1} / ${frames.length} (${frame.frame})`;
+            elBatch.innerText = frame.batch_id;
+
+            // Intersection
+            if (frame.intersection === 1) {
+                elIntersection.classList.add('active');
+            } else {
+                elIntersection.classList.remove('active');
+            }
+
+            // Steering
+            if (frame.condition === -1) {
+                elSteerIndicator.className = 'dir-left';
+                elSteerText.innerText = "◄ LEFT";
+                elSteerText.style.color = "var(--accent-red)";
+            } else if (frame.condition === 1) {
+                elSteerIndicator.className = 'dir-right';
+                elSteerText.innerText = "RIGHT ►";
+                elSteerText.style.color = "var(--accent-blue)";
+            } else {
+                elSteerIndicator.className = 'dir-straight';
+                elSteerText.innerText = "● STRAIGHT";
+                elSteerText.style.color = "var(--accent-green)";
+            }
+        }
+
+        // Update Backend
+        async function updateBackend(data) {
+            // we update current rendered frame
+            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
+            const frameObj = frames[idx];
+            
+            if (data.condition !== undefined) frameObj.condition = data.condition;
+            if (data.intersection !== undefined) frameObj.intersection = data.intersection;
+            
+            // visually update immediately
+            renderCurrentFrame();
+
+            try {
+                await fetch('/api/update', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ frame: frameObj.frame, ...data })
+                });
+            } catch(e) { console.error(e); }
+        }
+
+        // Actions
+        function applyCondition(val) {
+            updateBackend({ condition: val });
+        }
+
+        function toggleIntersection() {
+            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
+            const cur = frames[idx].intersection;
+            updateBackend({ intersection: cur === 1 ? 0 : 1 });
+        }
+
+        async function deleteBatch() {
+            if (frames.length === 0) return;
+            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
+            const frameObj = frames[idx];
+
+            if(!confirm(`Delete ENTIRE batch ${frameObj.batch_id}? This deletes ~10 images and CSV rows.`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/delete_batch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ frame: frameObj.frame })
+                });
+                const data = await res.json();
+                if(data.status === 'ok') {
+                    frames = data.frames;
+                    currentIndex = Math.min(currentIndex, frames.length - 1);
+                    showToast(`Batch ${frameObj.batch_id} deleted.`);
+                    renderCurrentFrame();
+                }
+            } catch(e) { console.error(e); }
+        }
+
+        async function undo() {
+            try {
+                const res = await fetch('/api/undo', { method: 'POST' });
+                const data = await res.json();
+                if(data.status === 'ok') {
+                    frames = data.frames;
+                    currentIndex = Math.min(currentIndex, frames.length - 1);
+                    showToast("Undo successful.", "success");
+                    renderCurrentFrame();
+                } else if(data.status === 'empty') {
+                    showToast("Nothing to undo.", "error");
+                }
+            } catch(e) { console.error(e); }
+        }
+
+        async function saveData(isAuto = false) {
+            try {
+                await fetch('/api/save', { method: 'POST' });
+                showToast(isAuto ? "Auto-saved" : "Dataset saved successfully", "success");
+            } catch(e) { console.error(e); }
+        }
+
+        // Keyboard Handling
+        window.addEventListener('keydown', (e) => {
+            if (e.repeat) return; // ignore repeated keystrokes on hold
+
+            switch(e.code) {
+                case 'Space':
+                    playing = !playing;
+                    renderCurrentFrame();
+                    break;
+                case 'KeyW':
+                    fps = Math.min(60, fps + 2);
+                    renderCurrentFrame();
+                    break;
+                case 'KeyS':
+                    fps = Math.max(1, fps - 2);
+                    renderCurrentFrame();
+                    break;
+                case 'ArrowLeft':
+                    leftHeld = true;
+                    applyCondition(-1);
+                    break;
+                case 'ArrowRight':
+                    rightHeld = true;
+                    applyCondition(1);
+                    break;
+                case 'KeyI':
+                    toggleIntersection();
+                    break;
+                case 'Backspace':
+                    // Go back 1 frame (if playing, we subtract 2 because loop advances)
+                    currentIndex = Math.max(0, currentIndex - 2);
+                    if(!playing) {
+                        currentIndex = Math.max(0, currentIndex + 1); 
+                        renderCurrentFrame();
+                    }
+                    break;
+                case 'KeyF':
+                    deleteBatch();
+                    break;
+                case 'Backquote': // ` key
+                    undo();
+                    break;
+                case 'Enter':
+                    saveData();
+                    break;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'ArrowLeft') {
+                leftHeld = false;
+                applyCondition(rightHeld ? 1 : 0);
+            }
+            if (e.code === 'ArrowRight') {
+                rightHeld = false;
+                applyCondition(leftHeld ? -1 : 0);
+            }
+        });
+
+        // Toast Helper
+        function showToast(msg, type='info') {
+            const el = document.createElement('div');
+            el.className = 'glass toast';
+            el.innerText = msg;
+            if (type === 'error') el.style.borderLeftColor = 'var(--accent-red)';
+            if (type === 'success') el.style.borderLeftColor = 'var(--accent-green)';
+            
+            elToastContainer.appendChild(el);
+            setTimeout(() => {
+                if(el.parentNode) el.parentNode.removeChild(el);
+            }, 2500);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>
