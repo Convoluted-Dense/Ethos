@@ -13,6 +13,8 @@ import os
 import sys
 import threading
 import time
+import socket
+import struct
 from ctypes import wintypes
 from collections import deque
 
@@ -44,10 +46,10 @@ class ActivationTracker:
         self.activations = {}
         self.hooks = []
         self.stages = {
-            "Stage 1 (Early Edges)": model.model.features[1],
-            "Stage 3 (Textures)": model.model.features[3],
-            "Stage 5 (Mid-Late Shapes)": model.model.features[5],
-            "Stage 7 (High Semantics)": model.model.features[7]
+            "Stage 1 (Early Edges)": model.backbone[0][1],
+            "Stage 3 (Textures)": model.backbone[0][3],
+            "Stage 5 (Mid-Late Shapes)": model.backbone[0][5],
+            "Stage 7 (High Semantics)": model.backbone[0][7]
         }
         for name, layer in self.stages.items():
             self.hooks.append(layer.register_forward_hook(self._make_hook(name)))
@@ -64,9 +66,13 @@ class ActivationTracker:
 # ---------------------------------------------------------------------------
 # vJoy constants
 # ---------------------------------------------------------------------------
-VJOY_AXIS_MIN = 0x0
-VJOY_AXIS_MAX = 0x8000  # 32768
-VJOY_AXIS_MID = (VJOY_AXIS_MAX + VJOY_AXIS_MIN) // 2
+VJOY_STEER_MIN = 0x0
+VJOY_STEER_MAX = 0x8000  # 32768
+VJOY_STEER_MID = (VJOY_STEER_MAX + VJOY_STEER_MIN) // 2
+
+VJOY_SPEED_MIN = 0
+VJOY_SPEED_MAX = 32768
+VJOY_SPEED_MID = 16384
 
 HID_USAGE_X = 0x30  # Steering
 HID_USAGE_Y = 0x31  # Throttle / Speed
@@ -77,39 +83,37 @@ HID_USAGE_Y = 0x31  # Throttle / Speed
 class SteeringModelV2(nn.Module):
     def __init__(self):
         super(SteeringModelV2, self).__init__()
-
         weights = EfficientNet_B1_Weights.DEFAULT
-        self.model = efficientnet_b1(weights=weights)
-
-        old_conv   = self.model.features[0][0]
-        old_weight = old_conv.weight.data.clone()
-
-        new_conv = nn.Conv2d(
-            in_channels=6,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=old_conv.bias is not None
+        base = efficientnet_b1(weights=weights)
+        
+        self.backbone = nn.Sequential(
+            base.features,
+            base.avgpool,
+            nn.Flatten()
         )
-        new_conv.weight.data[:, :3, :, :] = old_weight
-        new_conv.weight.data[:, 3:, :, :] = old_weight * 0.5
-        if old_conv.bias is not None:
-            new_conv.bias.data = old_conv.bias.data.clone()
-
-        self.model.features[0][0] = new_conv
-
-        in_features = self.model.classifier[1].in_features
-        self.model.classifier[1] = nn.Sequential(
+        
+        for i in range(1, 5):
+            for param in self.backbone[0][i].parameters():
+                param.requires_grad = False
+                
+        self.lstm = nn.LSTM(input_size=1280, hidden_size=256, num_layers=1, batch_first=True)
+        
+        self.head = nn.Sequential(
             nn.Dropout(p=0.3),
-            nn.Linear(in_features, 256),
+            nn.Linear(256, 128),
             nn.SiLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(256, 3)  # [steering, scaled_speed, lateral_offset]
+            nn.Linear(128, 3)
         )
 
     def forward(self, x):
-        return self.model(x)
+        B, seq_len, C, H, W = x.size()
+        x_flat = x.view(B * seq_len, C, H, W)
+        features = self.backbone(x_flat)
+        features = features.view(B, seq_len, -1)
+        lstm_out, (hn, cn) = self.lstm(features)
+        last_hidden = hn[-1]
+        return self.head(last_hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -200,22 +204,83 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # vJoy helpers
 # ---------------------------------------------------------------------------
+# UDP MotionSim telemetry receiver (BNG1)
+# ---------------------------------------------------------------------------
+BNG1_FORMAT = "4s" + "f" * 21
+BNG1_SIZE   = struct.calcsize(BNG1_FORMAT)
+BNG1_FIELDS = [
+    "posX",  "posY",  "posZ",
+    "velX",  "velY",  "velZ",
+    "accX",  "accY",  "accZ",
+    "upX",   "upY",   "upZ",
+    "rollPos",  "pitchPos",  "yawPos",
+    "rollVel",  "pitchVel",  "yawVel",
+    "rollAcc",  "pitchAcc",  "yawAcc",
+]
+
+class TelemetryReceiver:
+    def __init__(self, ip="0.0.0.0", port=4444):
+        self._lock = threading.Lock()
+        self._latest = None
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self._sock.bind((ip, port))
+        self._sock.settimeout(0.5)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(512)
+                if len(data) >= BNG1_SIZE:
+                    parts = struct.unpack_from(BNG1_FORMAT, data)
+                    if parts[0][:4] == b"BNG1":
+                        row = {name: parts[1 + i] for i, name in enumerate(BNG1_FIELDS)}
+                        with self._lock:
+                            self._latest = row
+            except Exception:
+                continue
+
+    def get_speed_ms(self) -> float:
+        with self._lock:
+            if not self._latest:
+                return 0.0
+            return math.sqrt(self._latest["velX"]**2 + self._latest["velY"]**2 + self._latest["velZ"]**2)
+
+# ---------------------------------------------------------------------------
+# vJoy helpers
+# ---------------------------------------------------------------------------
 def _steer_to_vjoy(steering: float) -> int:
     clamped = max(-1.0, min(1.0, steering))
-    return int(VJOY_AXIS_MID + clamped * (VJOY_AXIS_MAX - VJOY_AXIS_MID))
+    return int(VJOY_STEER_MID + clamped * (VJOY_STEER_MAX - VJOY_STEER_MID))
 
 def _speed_to_vjoy(scaled_speed: float) -> int:
     clamped = max(0.0, min(1.0, scaled_speed))
-    return int(VJOY_AXIS_MIN + clamped * (VJOY_AXIS_MAX - VJOY_AXIS_MIN))
+    return int(VJOY_SPEED_MIN + clamped * (VJOY_SPEED_MAX - VJOY_SPEED_MIN))
 
 
 class VJoySender:
     SEND_HZ = 60
-    def __init__(self, vjoy_device):
-        self._vjoy   = vjoy_device
-        self._lock   = threading.Lock()
-        self._steer  = VJOY_AXIS_MID
-        self._speed  = VJOY_AXIS_MIN
+    def __init__(self, vjoy_device, telemetry: TelemetryReceiver, max_speed: float, disable_throttle: bool = False):
+        self._vjoy = vjoy_device
+        self._telemetry = telemetry
+        self._max_speed = max_speed
+        self._disable_throttle = disable_throttle
+        self._lock = threading.Lock()
+        
+        self._steer = VJOY_STEER_MID
+        self._target_speed_ms = 0.0
+        
+        # Advanced Cruise Control variables
+        self._integral = 0.0
+        self._smoothed_output = 0.0
+        
+        # Public stats for HUD
+        self.current_speed_ms = 0.0
+        self.pid_output = 0.0
+
         self._active = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -223,15 +288,67 @@ class VJoySender:
     def set(self, steering_raw: float, scaled_speed: float):
         with self._lock:
             self._steer = _steer_to_vjoy(steering_raw)
-            self._speed = _speed_to_vjoy(scaled_speed)
+            self._target_speed_ms = scaled_speed * self._max_speed
 
     def _loop(self):
         interval = 1.0 / self.SEND_HZ
         while self._active:
             t0 = time.perf_counter()
+            
+            # Read real speed from UDP
+            cur_speed = self._telemetry.get_speed_ms()
+            
             with self._lock:
-                self._vjoy.data.wAxisX = self._steer
-                self._vjoy.data.wAxisY = self._speed
+                self.current_speed_ms = cur_speed
+                target = self._target_speed_ms
+                
+                # --- Advanced Cruise Control ---
+                error = target - cur_speed
+                
+                # 1. Base Throttle (Feedforward)
+                base_throttle = 0.15 * (target / max(1.0, self._max_speed)) if target > 0.5 else 0.0
+                
+                # 2. Proportional & Integral
+                if error > 0:
+                    Kp = 0.10
+                    p_term = Kp * error
+                    self._integral += error * interval * 0.05
+                    self._integral = min(0.60, max(0.0, self._integral))
+                else:
+                    Kp = 0.05 
+                    p_term = Kp * error
+                    base_throttle = 0.0
+                    self._integral = 0.0
+                
+                # 3. Raw Output
+                raw_output = base_throttle + p_term + self._integral
+                
+                # Deadzone for tiny errors
+                if abs(error) < 0.2 and target > 0:
+                    raw_output = base_throttle
+                
+                raw_output = max(-1.0, min(0.75, raw_output))
+                
+                # 4. Exponential Moving Average (EMA) Filter
+                self._smoothed_output = (0.98 * self._smoothed_output) + (0.02 * raw_output)
+                
+                output = self._smoothed_output
+                self.pid_output = output
+                
+                # Map PID output to Y axis
+                if output >= 0:
+                    y_val = VJOY_SPEED_MID + int(output * (VJOY_SPEED_MAX - VJOY_SPEED_MID))
+                else:
+                    y_val = VJOY_SPEED_MID - int(output * (VJOY_SPEED_MIN - VJOY_SPEED_MID))
+                
+                y_val = max(VJOY_SPEED_MIN, min(VJOY_SPEED_MAX, y_val))
+                
+                if self._disable_throttle:
+                    self._vjoy.data.wAxisX = self._steer
+                else:
+                    self._vjoy.data.wAxisX = self._steer
+                    self._vjoy.data.wAxisY = y_val
+
             try:
                 self._vjoy.update()
             except Exception:
@@ -245,8 +362,8 @@ class VJoySender:
         self._active = False
         if centre:
             try:
-                self._vjoy.data.wAxisX = VJOY_AXIS_MID
-                self._vjoy.data.wAxisY = VJOY_AXIS_MIN
+                self._vjoy.data.wAxisX = VJOY_STEER_MID
+                self._vjoy.data.wAxisY = VJOY_SPEED_MID
                 self._vjoy.update()
             except Exception:
                 pass
@@ -265,9 +382,9 @@ def _put(img, text, x, y, color=_CLR_GREEN, scale=0.6, thickness=2):
     cv2.putText(img, text, (x + 1, y + 1), _FONT, scale, _CLR_BLACK, thickness + 1, cv2.LINE_AA)
     cv2.putText(img, text, (x,     y    ), _FONT, scale, color,       thickness,     cv2.LINE_AA)
 
-def draw_hud(img: np.ndarray, steering: float, speed_kmh: float, offset: float, fps: float, vjoy_active: bool) -> np.ndarray:
+def draw_hud(img: np.ndarray, steering: float, speed_kmh: float, offset: float, fps: float, vjoy_active: bool, cur_speed_kmh: float = 0.0, pid_out: float = 0.0) -> np.ndarray:
     vis = img.copy()
-    ph, pw = 186, 460
+    ph, pw = 230, 460
     panel = vis[:ph, :pw].copy()
     cv2.rectangle(panel, (0, 0), (pw, ph), (8, 8, 8), -1)
     cv2.addWeighted(panel, 0.60, vis[:ph, :pw], 0.40, 0, vis[:ph, :pw])
@@ -284,7 +401,7 @@ def draw_hud(img: np.ndarray, steering: float, speed_kmh: float, offset: float, 
     y += 26
     _put(vis, f"Steering:  {steering:+.3f}", 10, y)
     bar_w = 200
-    bar_x = 175
+    bar_x = 200
     cv2.rectangle(vis, (bar_x, y - 14), (bar_x + bar_w, y), (50, 50, 50), -1)
     mid_x = bar_x + bar_w // 2
     if steering > 0:
@@ -298,7 +415,6 @@ def draw_hud(img: np.ndarray, steering: float, speed_kmh: float, offset: float, 
     _put(vis, f"Offset:    {offset:+.3f}", 10, y)
     cv2.rectangle(vis, (bar_x, y - 14), (bar_x + bar_w, y), (50, 50, 50), -1)
     mid_x = bar_x + bar_w // 2
-    # Offset is typically [-0.25, 0.25]. We scale it by 4 so it fills the bar nicely.
     display_offset = max(-1.0, min(1.0, offset * 4.0))
     if display_offset > 0:
         cv2.rectangle(vis, (mid_x, y - 14), (mid_x + int(display_offset * bar_w / 2), y), (255, 100, 100), -1)
@@ -308,11 +424,20 @@ def draw_hud(img: np.ndarray, steering: float, speed_kmh: float, offset: float, 
 
     # Speed
     y += 28
-    _put(vis, f"Speed:  {speed_kmh:6.1f} km/h", 10, y)
-    MAX_DISPLAY_KMH = 150.0
-    sv = min(speed_kmh / MAX_DISPLAY_KMH, 1.0)
+    _put(vis, f"Target Spd:  {speed_kmh:5.1f} km/h", 10, y, (0, 255, 255))
+    
+    y += 26
+    _put(vis, f"Actual Spd:  {cur_speed_kmh:5.1f} km/h", 10, y, _CLR_GREEN)
+    
+    y += 26
+    _put(vis, f"PID T/B:   {pid_out:+.2f}", 10, y, _CLR_WHITE)
     cv2.rectangle(vis, (bar_x, y - 14), (bar_x + bar_w, y), (50, 50, 50), -1)
-    cv2.rectangle(vis, (bar_x, y - 14), (bar_x + int(sv * bar_w), y), _CLR_GREEN, -1)
+    mid_x = bar_x + bar_w // 2
+    if pid_out > 0:
+        cv2.rectangle(vis, (mid_x, y - 14), (mid_x + int(pid_out * bar_w / 2), y), (0, 255, 0), -1)
+    elif pid_out < 0:
+        cv2.rectangle(vis, (mid_x + int(pid_out * bar_w / 2), y - 14), (mid_x, y), (0, 0, 255), -1)
+    cv2.line(vis, (mid_x, y - 16), (mid_x, y + 2), _CLR_WHITE, 1)
 
     y += 26
     _put(vis, "Q / ESC to quit", 10, y, (100, 100, 100), scale=0.50, thickness=1)
@@ -343,6 +468,8 @@ def make_parser():
                    help="display window height (default: 540)")
     p.add_argument("--steer-gain", type=float, default=1.0,
                    help="multiplier applied to the predicted steering")
+    p.add_argument("--disable-throttle", action="store_true",
+                   help="disable Cruise Control output so you can manually control pedals")
     return p
 
 # ---------------------------------------------------------------------------
@@ -393,22 +520,28 @@ def main():
         if not HAS_GRAD_CAM:
             print("[warn] --cam passed but pytorch-grad-cam not installed.")
         else:
-            target_layers = [model.model.features[-1]]
-            cam = GradCAM(model=model, target_layers=target_layers)
-            print("[init] Grad-CAM enabled for steering prediction.")
+            try:
+                target_layers = [model.backbone[0][-1]]
+                cam = GradCAM(model=model, target_layers=target_layers)
+                print("[init] Grad-CAM enabled for steering prediction.")
+            except Exception as e:
+                print(f"[warn] Grad-CAM cannot be initialized for LSTM model: {e}")
+                cam = None
 
     act_tracker = None
     if opt.activations:
         act_tracker = ActivationTracker(model)
         print("[init] Activation map visualization enabled.")
 
+    telemetry = TelemetryReceiver()
+
     vjoy = None
     if not opt.no_vjoy:
         try:
             import pyvjoy
             vjoy = pyvjoy.VJoyDevice(1)
-            vjoy.data.wAxisX  = VJOY_AXIS_MID
-            vjoy.data.wAxisY  = VJOY_AXIS_MIN
+            vjoy.data.wAxisX  = VJOY_STEER_MID
+            vjoy.data.wAxisY  = VJOY_SPEED_MID
             vjoy.update()
             print("[init] vJoy device 1 acquired and centred")
         except Exception as e:
@@ -418,7 +551,7 @@ def main():
     vjoy_active = vjoy is not None
     vjoy_sender = None
     if vjoy_active:
-        vjoy_sender = VJoySender(vjoy)
+        vjoy_sender = VJoySender(vjoy, telemetry, max_speed, opt.disable_throttle)
         print(f"[init] vJoy sender thread started at {VJoySender.SEND_HZ} Hz")
 
     if not opt.headless:
@@ -461,29 +594,32 @@ def main():
 
             # 3. Inference
             if cam is not None:
-                tensor.requires_grad_(True)
-                out = model(tensor)
-                targets = [RegressionTarget(target_idx=0)]
-                grayscale_cam = cam(input_tensor=tensor, targets=targets)[0, :]
-                
-                # Reconstruct current frame (channels 3:6) for display
-                mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-                curr_t_unnorm = tensor[0:1, -1, :, :, :] * std + mean
-                img_float = curr_t_unnorm[0].permute(1, 2, 0).detach().cpu().numpy()
-                img_float = np.clip(img_float, 0, 1)
-                img_bgr = img_float[:, :, ::-1]
-                
-                cam_view = show_cam_on_image(img_bgr, grayscale_cam, use_rgb=False)
-                cam_view_large = cv2.resize(cam_view, (960, 198))
-                cv2.imshow("Model View (Grad-CAM)", cam_view_large)
+                try:
+                    tensor.requires_grad_(True)
+                    out = model(tensor)
+                    targets = [RegressionTarget(target_idx=0)]
+                    grayscale_cam = cam(input_tensor=tensor, targets=targets)[-1, :]
+                    
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    curr_t_unnorm = tensor[0:1, -1, :, :, :] * std + mean
+                    img_float = curr_t_unnorm[0].permute(1, 2, 0).detach().cpu().numpy()
+                    img_float = np.clip(img_float, 0, 1)
+                    img_bgr = img_float[:, :, ::-1]
+                    
+                    cam_view = show_cam_on_image(img_bgr, grayscale_cam, use_rgb=False)
+                    cam_view_large = cv2.resize(cam_view, (960, 198))
+                    cv2.imshow("Model View (Grad-CAM)", cam_view_large)
+                except Exception as e:
+                    print(f"\n[warn] Grad-CAM inference failed: {e}. Disabling Grad-CAM.")
+                    cam = None
             elif act_tracker is not None:
-                out = model(tensor)
                 stages_to_show = ["Stage 1 (Early Edges)", "Stage 3 (Textures)", "Stage 5 (Mid-Late Shapes)", "Stage 7 (High Semantics)"]
                 activation_maps = []
                 for stage_name in stages_to_show:
-                    feat = act_tracker.activations.get(stage_name)
-                    if feat is not None:
+                    feat_full = act_tracker.activations.get(stage_name)
+                    if feat_full is not None:
+                        feat = feat_full[-1:]
                         act = torch.norm(feat[0], p=2, dim=0).cpu().numpy()
                         act_min, act_max = act.min(), act.max()
                         if act_max > act_min:
@@ -513,8 +649,11 @@ def main():
             
             pred_speed_kmh    = pred_scaled_speed * max_speed * 3.6
 
+            # Hard limit speed from 0 to 30 km/h
+            pred_speed_kmh    = max(0.0, min(30.0, pred_speed_kmh))
+            pred_scaled_speed = pred_speed_kmh / (max_speed * 3.6)
+
             pred_steering     = max(-1.0, min(1.0, pred_steering))
-            pred_scaled_speed = max(0.0,  min(1.0, pred_scaled_speed))
 
             # 4. vJoy
             if vjoy_sender is not None:
@@ -529,7 +668,18 @@ def main():
                 t_fps_ref = now
 
             if not opt.headless:
-                vis = draw_hud(raw, pred_steering, pred_speed_kmh, pred_offset, fps_display, vjoy_active)
+                cur_speed_kmh = telemetry.get_speed_ms() * 3.6
+                pid_out = vjoy_sender.pid_output if vjoy_sender else 0.0
+                
+                # Debug print to terminal
+                if pid_out > 0:
+                    print(f"\r[PID] Throttle: {pid_out * 100:5.1f}% | Brake:   0.0%  (Target: {pred_speed_kmh:4.1f} km/h, Cur: {cur_speed_kmh:4.1f} km/h)      ", end="", flush=True)
+                elif pid_out < 0:
+                    print(f"\r[PID] Throttle:   0.0% | Brake: {-pid_out * 100:5.1f}%  (Target: {pred_speed_kmh:4.1f} km/h, Cur: {cur_speed_kmh:4.1f} km/h)      ", end="", flush=True)
+                else:
+                    print(f"\r[PID] Throttle:   0.0% | Brake:   0.0%  (Target: {pred_speed_kmh:4.1f} km/h, Cur: {cur_speed_kmh:4.1f} km/h)      ", end="", flush=True)
+
+                vis = draw_hud(raw, pred_steering, pred_speed_kmh, pred_offset, fps_display, vjoy_active, cur_speed_kmh, pid_out)
                 dh, dw = vis.shape[:2]
                 scale = min(opt.width / dw, opt.height / dh)
                 if scale != 1.0:

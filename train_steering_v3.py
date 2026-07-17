@@ -295,8 +295,20 @@ class SteeringDatasetV3(Dataset):
             raise RuntimeError(f"No telemetry for {basename}")
 
         row      = self.telemetry[tel_idx]
-        steering = float(row.get('steering_combined', row['steering']))
-        vx, vy   = float(row['velX']), float(row['velY'])
+        try:
+            val = row.get('steering_combined')
+            if not val:
+                val = row.get('steering')
+            steering = float(val or 0.0)
+        except (ValueError, TypeError):
+            steering = 0.0
+
+        try:
+            vx = float(row.get('velX') or 0.0)
+            vy = float(row.get('velY') or 0.0)
+        except (ValueError, TypeError):
+            vx, vy = 0.0, 0.0
+
         try:
             offset = float(row.get('steering_offset', 0.0) or 0.0)
         except (ValueError, TypeError):
@@ -390,7 +402,7 @@ def main():
     else:
         print(f"Using telemetry: {telemetry_path}")
 
-    batch_size   = 48
+    batch_size   = 24
     epochs       = 25
     lr           = 1e-3
     weight_decay = 1e-4
