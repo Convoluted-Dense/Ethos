@@ -65,7 +65,7 @@ def ensure_columns():
             row['intersection'] = '0'
     return changed
 
-def init_dataset():
+def init_dataset(start_idx=0):
     if not state.img_dir.exists():
         print(f"[ERROR] Image directory not found: {state.img_dir}")
         sys.exit(1)
@@ -83,6 +83,8 @@ def init_dataset():
     
     # Only keep images that have a CSV row
     state.frames = [f for f in all_imgs if f in state.frame_to_row]
+    if start_idx > 0:
+        state.frames = state.frames[start_idx:]
     
     if dirty:
         save_csv()
@@ -211,8 +213,8 @@ def api_save():
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
-def run_app(port=5000):
-    init_dataset()
+def run_app(port=5000, start_idx=0):
+    init_dataset(start_idx)
     url = f"http://127.0.0.1:{port}"
     print(f"\n[EthosDit Web UI] Starting server at {url}")
     print("[EthosDit Web UI] Opening browser automatically...\n")
@@ -221,4 +223,9 @@ def run_app(port=5000):
     app.run(host='127.0.0.1', port=port, debug=False)
 
 if __name__ == '__main__':
-    run_app()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start', type=int, default=0, help='Start index for frames')
+    args = parser.parse_args()
+    
+    run_app(start_idx=args.start)

@@ -243,6 +243,12 @@
         </div>
     </div>
 
+    <div id="mode-indicators" style="position: absolute; top: 90px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; z-index: 100;">
+        <div id="ind-left" class="glass" style="padding: 8px 16px; border-radius: 20px; color: var(--accent-red); font-weight: bold; display: none; border-color: var(--accent-red);">◄ LEFT MODE ON</div>
+        <div id="ind-int" class="glass" style="padding: 8px 16px; border-radius: 20px; color: var(--accent-yellow); font-weight: bold; display: none; border-color: var(--accent-yellow);">INTERSECTION MODE ON</div>
+        <div id="ind-right" class="glass" style="padding: 8px 16px; border-radius: 20px; color: var(--accent-blue); font-weight: bold; display: none; border-color: var(--accent-blue);">RIGHT MODE ON ►</div>
+    </div>
+
     <div id="toast-container"></div>
 
     <div id="viewer-container">
@@ -261,7 +267,8 @@
         <span><span class="key">Space</span> Play/Pause</span>
         <span><span class="key">W</span> / <span class="key">S</span> Speed</span>
         <span><span class="key">←</span> / <span class="key">→</span> (Hold) Steer</span>
-        <span><span class="key">I</span> Intersection</span>
+        <span><span class="key">↓</span> Clear All</span>
+        <span><span class="key">I</span> Toggle Intersection</span>
         <span><span class="key">F</span> Del Batch</span>
         <span><span class="key">`</span> Undo</span>
         <span><span class="key">Bksp</span> Back</span>
@@ -280,6 +287,7 @@
         // Key states
         let leftHeld = false;
         let rightHeld = false;
+        let intersectionMode = false;
         
         // DOM Elements
         const elImage = document.getElementById('image-frame');
@@ -291,6 +299,10 @@
         const elSteerIndicator = document.getElementById('steering-indicator');
         const elSteerText = document.getElementById('steering-text');
         const elToastContainer = document.getElementById('toast-container');
+        
+        const indLeft = document.getElementById('ind-left');
+        const indRight = document.getElementById('ind-right');
+        const indInt = document.getElementById('ind-int');
 
         // Initialization
         async function init() {
@@ -301,6 +313,7 @@
                 fps = data.fps;
                 
                 if (frames.length > 0) {
+                    renderCurrentFrame();
                     requestAnimationFrame(playbackLoop);
                 } else {
                     showToast("No frames found!", "error");
@@ -317,8 +330,10 @@
                 const delay = 1000 / fps;
                 if (timestamp - lastDrawTime >= delay) {
                     lastDrawTime = timestamp;
-                    renderCurrentFrame();
+                    
                     currentIndex = (currentIndex + 1) % frames.length;
+                    applyActiveModesToCurrentFrame();
+                    renderCurrentFrame();
                     
                     framesVisited++;
                     if (framesVisited % 500 === 0) {
@@ -327,6 +342,58 @@
                 }
             }
             requestAnimationFrame(playbackLoop);
+        }
+
+        function updateModeIndicators() {
+            const frameObj = (frames && frames.length > 0) ? frames[currentIndex] : null;
+            
+            const isLeft = leftHeld || (frameObj && frameObj.condition === -1);
+            const isRight = rightHeld || (frameObj && frameObj.condition === 1);
+            const isInt = intersectionMode || (frameObj && frameObj.intersection == 1);
+
+            indLeft.style.display = isLeft ? 'block' : 'none';
+            indRight.style.display = isRight ? 'block' : 'none';
+            indInt.style.display = isInt ? 'block' : 'none';
+        }
+
+        function applyActiveModesToCurrentFrame() {
+            if (frames.length === 0) return;
+            const frameObj = frames[currentIndex];
+            let newCond = frameObj.condition;
+            let newInt = frameObj.intersection;
+
+            if (leftHeld && !rightHeld) newCond = -1;
+            else if (rightHeld && !leftHeld) newCond = 1;
+
+            if (intersectionMode) newInt = 1;
+
+            if (frameObj.condition !== newCond || frameObj.intersection !== newInt) {
+                updateBackendSilent(currentIndex, { condition: newCond, intersection: newInt });
+            }
+        }
+
+        async function updateBackendSilent(idx, data) {
+            const frameObj = frames[idx];
+            if (data.condition !== undefined) frameObj.condition = data.condition;
+            if (data.intersection !== undefined) frameObj.intersection = data.intersection;
+            try {
+                await fetch('/api/update', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ frame: frameObj.frame, ...data })
+                });
+            } catch(e) { console.error(e); }
+        }
+
+        function applyConditionManual(val) {
+            updateBackendSilent(currentIndex, { condition: val });
+            renderCurrentFrame();
+        }
+
+        function toggleIntersectionManual() {
+            const cur = frames[currentIndex].intersection;
+            updateBackendSilent(currentIndex, { intersection: cur === 1 ? 0 : 1 });
+            renderCurrentFrame();
         }
 
         // Render Frame Data to UI
@@ -369,44 +436,13 @@
                 elSteerText.innerText = "● STRAIGHT";
                 elSteerText.style.color = "var(--accent-green)";
             }
-        }
-
-        // Update Backend
-        async function updateBackend(data) {
-            // we update current rendered frame
-            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
-            const frameObj = frames[idx];
             
-            if (data.condition !== undefined) frameObj.condition = data.condition;
-            if (data.intersection !== undefined) frameObj.intersection = data.intersection;
-            
-            // visually update immediately
-            renderCurrentFrame();
-
-            try {
-                await fetch('/api/update', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ frame: frameObj.frame, ...data })
-                });
-            } catch(e) { console.error(e); }
-        }
-
-        // Actions
-        function applyCondition(val) {
-            updateBackend({ condition: val });
-        }
-
-        function toggleIntersection() {
-            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
-            const cur = frames[idx].intersection;
-            updateBackend({ intersection: cur === 1 ? 0 : 1 });
+            updateModeIndicators();
         }
 
         async function deleteBatch() {
             if (frames.length === 0) return;
-            const idx = (currentIndex === 0) ? frames.length - 1 : currentIndex - 1;
-            const frameObj = frames[idx];
+            const frameObj = frames[currentIndex];
 
             if(!confirm(`Delete ENTIRE batch ${frameObj.batch_id}? This deletes ~10 images and CSV rows.`)) {
                 return;
@@ -469,22 +505,37 @@
                     break;
                 case 'ArrowLeft':
                     leftHeld = true;
-                    applyCondition(-1);
+                    intersectionMode = true;
+                    updateModeIndicators();
+                    applyActiveModesToCurrentFrame();
+                    renderCurrentFrame();
                     break;
                 case 'ArrowRight':
                     rightHeld = true;
-                    applyCondition(1);
+                    intersectionMode = true;
+                    updateModeIndicators();
+                    applyActiveModesToCurrentFrame();
+                    renderCurrentFrame();
+                    break;
+                case 'ArrowDown':
+                case 'ArrowUp':
+                    intersectionMode = false;
+                    updateBackendSilent(currentIndex, { condition: 0, intersection: 0 });
+                    updateModeIndicators();
+                    renderCurrentFrame();
                     break;
                 case 'KeyI':
-                    toggleIntersection();
+                    const curInt = frames[currentIndex].intersection == 1 ? 1 : 0;
+                    const nextInt = curInt === 1 ? 0 : 1;
+                    intersectionMode = (nextInt === 1);
+                    updateBackendSilent(currentIndex, { intersection: nextInt });
+                    updateModeIndicators();
+                    renderCurrentFrame();
                     break;
                 case 'Backspace':
-                    // Go back 1 frame (if playing, we subtract 2 because loop advances)
-                    currentIndex = Math.max(0, currentIndex - 2);
-                    if(!playing) {
-                        currentIndex = Math.max(0, currentIndex + 1); 
-                        renderCurrentFrame();
-                    }
+                    // Go back 1 frame
+                    currentIndex = Math.max(0, currentIndex - 1);
+                    renderCurrentFrame();
                     break;
                 case 'KeyF':
                     deleteBatch();
@@ -501,11 +552,13 @@
         window.addEventListener('keyup', (e) => {
             if (e.code === 'ArrowLeft') {
                 leftHeld = false;
-                applyCondition(rightHeld ? 1 : 0);
+                intersectionMode = false;
+                updateModeIndicators();
             }
             if (e.code === 'ArrowRight') {
                 rightHeld = false;
-                applyCondition(leftHeld ? -1 : 0);
+                intersectionMode = false;
+                updateModeIndicators();
             }
         });
 

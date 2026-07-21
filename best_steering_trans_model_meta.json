@@ -1,0 +1,14 @@
+{
+  "max_speed": 26.996723990592823,
+  "version": "trans_vit",
+  "seq_len": 4,
+  "outputs": [
+    "steering",
+    "scaled_speed",
+    "lateral_offset"
+  ],
+  "inputs": [
+    "images",
+    "condition"
+  ]
+}

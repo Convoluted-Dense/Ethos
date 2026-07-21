@@ -1,0 +1,15 @@
+{
+  "max_speed": 26.996723990592823,
+  "version": "trans_vit_tiny_sim",
+  "seq_len": 4,
+  "outputs": [
+    "steering",
+    "scaled_speed",
+    "lateral_offset",
+    "intersection"
+  ],
+  "inputs": [
+    "images",
+    "condition"
+  ]
+}

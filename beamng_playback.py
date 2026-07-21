@@ -53,7 +53,8 @@ def draw_hud(img: np.ndarray, telem: dict | None,
              paused: bool, steering: float = 0.0,
              map_img: np.ndarray | None = None,
              offset: float = 0.0,
-             steering_combined: float = 0.0) -> np.ndarray:
+             steering_combined: float = 0.0,
+             future_telems: list = None) -> np.ndarray:
     vis = img.copy()
     ph, pw = 335, 500
 
@@ -113,36 +114,40 @@ def draw_hud(img: np.ndarray, telem: dict | None,
         _put(vis, "No telemetry for this frame", 10, y, _CLR_NOD)
         return vis
 
+    def _g(key):
+        val = telem.get(key)
+        return val if val is not None else 0.0
+
     # Speed
-    vx, vy, vz = telem.get("velX", 0), telem.get("velY", 0), telem.get("velZ", 0)
+    vx, vy, vz = _g("velX"), _g("velY"), _g("velZ")
     speed_kmh = math.sqrt(vx**2 + vy**2 + vz**2) * 3.6
     y += 26; _put(vis, f"Speed    {speed_kmh:8.2f} km/h", 10, y)
 
     # Acceleration
-    ax, ay, az = telem.get("accX", 0), telem.get("accY", 0), telem.get("accZ", 0)
+    ax, ay, az = _g("accX"), _g("accY"), _g("accZ")
     acc_g = math.sqrt(ax**2 + ay**2 + az**2) / 9.81
     y += 26; _put(vis, f"Accel    {acc_g:8.3f} g   ({ax:.2f}, {ay:.2f}, {az:.2f} m/s^2)", 10, y)
 
     # Attitude
-    roll  = math.degrees(telem.get("rollPos",  0))
-    pitch = math.degrees(telem.get("pitchPos", 0))
-    yaw   = math.degrees(telem.get("yawPos",   0))
+    roll  = math.degrees(_g("rollPos"))
+    pitch = math.degrees(_g("pitchPos"))
+    yaw   = math.degrees(_g("yawPos"))
     y += 26; _put(vis, f"Roll  {roll:+7.2f} deg   Pitch {pitch:+7.2f} deg   Yaw {yaw:+7.2f} deg", 10, y)
 
     # Angular velocity
-    rv = telem.get("rollVel",  0)
-    pv = telem.get("pitchVel", 0)
-    yv = telem.get("yawVel",   0)
+    rv = _g("rollVel")
+    pv = _g("pitchVel")
+    yv = _g("yawVel")
     y += 26; _put(vis, f"AngVel   r={rv:+.3f}  p={pv:+.3f}  y={yv:+.3f}  rad/s", 10, y)
 
     # Angular acceleration
-    ra = telem.get("rollAcc",  0)
-    pa = telem.get("pitchAcc", 0)
-    ya = telem.get("yawAcc",   0)
+    ra = _g("rollAcc")
+    pa = _g("pitchAcc")
+    ya = _g("yawAcc")
     y += 26; _put(vis, f"AngAcc   r={ra:+.3f}  p={pa:+.3f}  y={ya:+.3f}  rad/s^2", 10, y)
 
     # Position
-    px = telem.get("posX", 0); py2 = telem.get("posY", 0); pz = telem.get("posZ", 0)
+    px = _g("posX"); py2 = _g("posY"); pz = _g("posZ")
     y += 26; _put(vis, f"Pos  ({px:.1f}, {py2:.1f}, {pz:.1f})", 10, y)
 
     # Display Map overlay if provided
@@ -161,6 +166,75 @@ def draw_hud(img: np.ndarray, telem: dict | None,
             cv2.rectangle(vis, (vis.shape[1] - mw - padding - 2, padding - 2), 
                           (vis.shape[1] - padding + 2, padding + mh + 2), (0, 255, 0), 2)
             vis[padding:padding+mh, vis.shape[1]-mw-padding:vis.shape[1]-padding] = map_bgr
+
+    # Draw BEV Trajectory
+    bev_size = 200
+    if future_telems and telem:
+        bev = np.zeros((bev_size, bev_size, 3), dtype=np.uint8)
+        cv2.rectangle(bev, (0, 0), (bev_size, bev_size), (25, 25, 25), -1)
+        car_x, car_y = bev_size // 2, int(bev_size * 0.8)
+        cv2.drawContours(bev, [np.array([[car_x, car_y - 10], [car_x - 6, car_y + 6], [car_x + 6, car_y + 6]])], 0, (0, 255, 128), -1)
+        
+        c_x = _g('posX')
+        c_y = _g('posY')
+        yaw = _g('yawPos')
+        
+        scale = 3.0 # pixels per meter (200px = ~66m)
+        # Shift entire trajectory left/right based on offset
+        # Assume 1.0 offset = 20m lateral shift
+        lat_shift = offset * 20.0
+        
+        pts = [(car_x, car_y)]
+        for f_t in future_telems:
+            if not f_t: continue
+            
+            f_x = f_t.get('posX')
+            f_y = f_t.get('posY')
+            
+            # Default to c_x / c_y if missing or None
+            f_x = f_x if f_x is not None else c_x
+            f_y = f_y if f_y is not None else c_y
+            
+            dx = f_x - c_x
+            dy = f_y - c_y
+            
+            # Robust Vector Projection
+            # BeamNG yaw rotates in the opposite direction to standard math,
+            # which caused the trajectory to rotate backwards and flip upside down on turns.
+            # We negate yaw to fix the rotation direction!
+            adjusted_yaw = -yaw
+            
+            Fx = -math.sin(adjusted_yaw)
+            Fy = math.cos(adjusted_yaw)
+            
+            Rx = math.cos(adjusted_yaw)
+            Ry = math.sin(adjusted_yaw)
+            
+            # Project displacement onto the car's local Forward and Right axes
+            # We negate the final result to flip the trajectory 180 degrees
+            # (fixing the "upside down" issue) while keeping the yaw rotation correct!
+            loc_y = -(dx * Fx + dy * Fy)
+            loc_x = -(dx * Rx + dy * Ry)
+            
+            loc_x += lat_shift
+            
+            px = int(car_x + loc_x * scale)
+            py = int(car_y - loc_y * scale)
+            pts.append((px, py))
+            
+        for i in range(len(pts) - 1):
+            cv2.line(bev, pts[i], pts[i+1], (0, 200, 255), 2)
+            cv2.circle(bev, pts[i+1], 4, (0, 120, 255), -1)
+            
+        cv2.rectangle(bev, (0, 0), (bev_size-1, bev_size-1), (100, 100, 100), 1)
+        
+        # Overlay BEV at top center
+        pad = 10
+        bx = vis.shape[1] // 2 - bev_size // 2
+        by = pad
+        if by + bev_size <= vis.shape[0] and bx + bev_size <= vis.shape[1]:
+            vis[by:by+bev_size, bx:bx+bev_size] = bev
+            cv2.putText(vis, "BEV Trajectory", (bx + 5, by + 15), _FONT, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Controls reminder at bottom-right
     hint = "SPACE=pause  LEFT/RIGHT=step  Q=quit"
@@ -197,13 +271,18 @@ def load_dataset(dataset_dir: Path):
     print(f"[dataset] {len(frames)} frames in {img_dir}")
 
     # Infer FPS from timestamp filenames if they look numeric
-    fps = 10.0
+    fps = 30.0
     try:
         t0 = float(frames[0].stem)
         t1 = float(frames[-1].stem)
         if t1 > t0:
-            fps = (len(frames) - 1) / (t1 - t0)
-            print(f"[dataset] Inferred FPS: {fps:.2f}")
+            inferred = (len(frames) - 1) / (t1 - t0)
+            # Only use inferred if it's reasonable (timestamps might be in ms!)
+            if inferred > 5.0:
+                fps = inferred
+                print(f"[dataset] Inferred FPS: {fps:.2f}")
+            else:
+                print(f"[dataset] Inferred FPS ({inferred:.2f}) too low, defaulting to 30.0")
     except ValueError:
         print(f"[dataset] Could not infer FPS from filenames, assuming {fps:.1f}")
 
@@ -318,6 +397,15 @@ def main():
         map_path = dataset_dir / "map" / frame_path.name
         if map_path.exists():
             map_img = cv2.imread(str(map_path))
+            
+        # Extract future 5 waypoints
+        lookahead_frames = [5, 10, 15, 20, 25]
+        future_telems = []
+        if t: # if current telemetry is valid
+            for lf in lookahead_frames:
+                fut_idx = min(idx + lf, total - 1)
+                fut_row = telem.get(frames[fut_idx].name)
+                future_telems.append(fut_row)
 
         # Compute elapsed dataset time from the frame's own timestamp if available
         try:
@@ -326,7 +414,7 @@ def main():
             elapsed_s = idx / fps
 
         # Draw HUD
-        vis = draw_hud(img, t, idx, total, elapsed_s, opt.speed, paused, steering_val, map_img, offset=offset_val, steering_combined=combined_val)
+        vis = draw_hud(img, t, idx, total, elapsed_s, opt.speed, paused, steering_val, map_img, offset=offset_val, steering_combined=combined_val, future_telems=future_telems)
 
         # Fit to display window dimensions
         dh, dw = vis.shape[:2]

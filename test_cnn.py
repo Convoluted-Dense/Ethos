@@ -297,8 +297,12 @@ class VJoySender:
         while self._active:
             t0 = time.perf_counter()
             with self._lock:
-                self._vjoy.data.wAxisX = self._steer
-                self._vjoy.data.wAxisY = self._speed
+                if not getattr(self, 'ai_enabled', True):
+                    self._vjoy.data.wAxisX = VJOY_AXIS_MID
+                    self._vjoy.data.wAxisY = VJOY_AXIS_MIN
+                else:
+                    self._vjoy.data.wAxisX = self._steer
+                    self._vjoy.data.wAxisY = self._speed
             try:
                 self._vjoy.update()
             except Exception:
@@ -479,6 +483,8 @@ def main():
 
     # ── vJoy setup ─────────────────────────────────────────────────────────
     vjoy = None
+    sct = mss.mss()
+
     if not opt.no_vjoy:
         try:
             import pyvjoy
@@ -531,7 +537,11 @@ def main():
 
             # 1. Capture frame ------------------------------------------------
             t_cap_start = time.perf_counter()
-            raw = capture_printwindow(hwnd)
+            monitor = get_window_rect(hwnd)
+            if monitor is None:
+                time.sleep(0.01)
+                continue
+            raw = capture_mss(sct, monitor)
             if raw is None:
                 time.sleep(0.01)
                 continue
@@ -671,6 +681,11 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):  # Q or ESC
                     break
+                elif key == ord("0"):
+                    if vjoy_sender:
+                        vjoy_sender.ai_enabled = not getattr(vjoy_sender, "ai_enabled", True)
+                        state = "ON" if vjoy_sender.ai_enabled else "OFF"
+                        print(f"\n[input] AI Control toggled to: {state}")
             else:
                 # If cam is active in headless, we still need waitKey to render the cam window
                 if cam is not None:

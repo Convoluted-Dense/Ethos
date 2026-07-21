@@ -665,8 +665,8 @@ def main():
                         failsafe_ref_time = capture_time
                     else:
                         # Vehicle is still within 50m radius
-                        if capture_time - failsafe_ref_time > 120.0:
-                            print(f"\n[failsafe] Vehicle stuck in 50m radius for 2 mins (dist={dist:.1f}m). Pressing HOME to reset!")
+                        if capture_time - failsafe_ref_time > 60.0:
+                            print(f"\n[failsafe] Vehicle stuck in 50m radius for 60 seconds (dist={dist:.1f}m). Pressing HOME to reset!")
                             
                             # Send HOME key (VK_HOME = 0x24) to the background window
                             WM_KEYDOWN = 0x0100

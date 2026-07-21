@@ -141,6 +141,28 @@ def find_beamng_window():
     return None
 
 
+
+import mss
+from ctypes import wintypes
+
+def get_window_rect(hwnd):
+    user32  = ctypes.windll.user32
+    cr = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(cr))
+    w = cr.right  - cr.left
+    h = cr.bottom - cr.top
+    if w <= 0 or h <= 0:
+        return None
+    pt = ctypes.wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    return {'left': pt.x, 'top': pt.y, 'width': w, 'height': h}
+
+def capture_mss(sct, monitor):
+    frame = sct.grab(monitor)
+    img = np.frombuffer(frame.raw, dtype=np.uint8).reshape((frame.height, frame.width, 4))
+    return img[:, :, :3].copy()
+
+
 def capture_printwindow(hwnd):
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
@@ -529,6 +551,8 @@ def main():
         print("[init] Activation map visualization enabled.")
 
     telemetry = TelemetryReceiver()
+    sct = mss.mss()
+
     vjoy = None
     if not opt.no_vjoy:
         try:
@@ -569,7 +593,11 @@ def main():
             t0 = time.perf_counter()
 
             # 1. Capture
-            raw = capture_printwindow(hwnd)
+            monitor = get_window_rect(hwnd)
+            if monitor is None:
+                time.sleep(0.01)
+                continue
+            raw = capture_mss(sct, monitor)
             if raw is None:
                 time.sleep(0.01)
                 continue
@@ -661,6 +689,11 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
+                elif key == ord("0"):
+                    if vjoy_sender:
+                        vjoy_sender.ai_enabled = not getattr(vjoy_sender, "ai_enabled", True)
+                        state = "ON" if vjoy_sender.ai_enabled else "OFF"
+                        print(f"\n[input] AI Control toggled to: {state}")
             else:
                 if cam is not None or act_tracker is not None:
                     cv2.waitKey(1)

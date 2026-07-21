@@ -726,6 +726,11 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
+                elif key == ord("0"):
+                    if vjoy_sender:
+                        vjoy_sender.ai_enabled = not getattr(vjoy_sender, "ai_enabled", True)
+                        state = "ON" if vjoy_sender.ai_enabled else "OFF"
+                        print(f"\n[input] AI Control toggled to: {state}")
             else:
                 if cam is not None or act_tracker is not None:
                     cv2.waitKey(1)

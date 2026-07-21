@@ -2,10 +2,11 @@
 train_steering_v2.py
 ====================
 V2 training pipeline with:
-  - 2-frame temporal stacking (6-channel input to EfficientNet B1)
-  - 3 regression outputs: [steering, scaled_speed, lateral_offset]
+  - 10-frame temporal sequence input to EfficientNet B1 + LSTM
+  - Condition input (-1, 0, 1) concatenated to LSTM hidden state
+  - 4 outputs: [steering, scaled_speed, lateral_offset, intersection]
   - Diffusion-safe frame pairing (diffused prev -> diffused curr, never mixed)
-  - Coherent augmentations applied identically to both frames in a pair
+  - Coherent augmentations applied identically to all frames in a sequence
 """
 
 import os
@@ -218,7 +219,7 @@ class SteeringDatasetV2(Dataset):
         img = TF.resize(img, (240, 240))
         return img
 
-    def _get_sequence_frames(self, folder, basename, seq_len=5):
+    def _get_sequence_frames(self, folder, basename, seq_len=10):
         """
         Returns a list of `seq_len` PIL Images ending with the current frame.
         For diffused images: prefers diffused previous, falls back to real previous.
@@ -275,7 +276,7 @@ class SteeringDatasetV2(Dataset):
     def __getitem__(self, idx):
         folder, basename = self.images[idx]
 
-        frames = self._get_sequence_frames(folder, basename, seq_len=5)
+        frames = self._get_sequence_frames(folder, basename, seq_len=10)
         if frames is None or frames[-1] is None:
             return self.__getitem__((idx + 1) % len(self.images))
 
@@ -296,27 +297,47 @@ class SteeringDatasetV2(Dataset):
 
         row = self.telemetry[telemetry_idx]
         steering = float(row.get('steering_combined', row['steering']))
-        velX     = float(row['velX'])
-        velY     = float(row['velY'])
+        try:
+            velX = float(row['velX'])
+        except (ValueError, TypeError, KeyError):
+            velX = 0.0
+            
+        try:
+            velY = float(row['velY'])
+        except (ValueError, TypeError, KeyError):
+            velY = 0.0
+
         try:
             offset = float(row.get('steering_offset', 0.0) or 0.0)
         except (ValueError, TypeError):
             offset = 0.0
 
+        try:
+            condition = float(row.get('condition', 0.0) or 0.0)
+        except (ValueError, TypeError):
+            condition = 0.0
+
+        try:
+            intersection = float(row.get('intersection', 0.0) or 0.0)
+        except (ValueError, TypeError):
+            intersection = 0.0
+
         speed        = math.sqrt(velX**2 + velY**2)
         scaled_speed = speed / self.max_speed
 
-        labels_tensor = torch.tensor([steering, scaled_speed, offset], dtype=torch.float32)
-        return stacked, labels_tensor
+        condition_tensor = torch.tensor([condition], dtype=torch.float32)
+        labels_tensor = torch.tensor([steering, scaled_speed, offset, intersection], dtype=torch.float32)
+        return stacked, condition_tensor, labels_tensor
 
 
 # ---------------------------------------------------------------------------
-# V2 Model -- EfficientNet B1 with 6-channel inflated first conv, 3 outputs
+# V2 Model -- EfficientNet B1 + LSTM with condition input, 4 outputs
 # ---------------------------------------------------------------------------
 class SteeringModelV2(nn.Module):
     """
-    EfficientNet B1 modified for 5-frame sequence input using an LSTM.
-    3 regression outputs: [steering, scaled_speed, lateral_offset].
+    EfficientNet B1 modified for 10-frame sequence input using an LSTM.
+    Takes condition (-1, 0, 1) as additional input.
+    4 outputs: [steering, scaled_speed, lateral_offset, intersection].
     """
     def __init__(self):
         super(SteeringModelV2, self).__init__()
@@ -339,17 +360,17 @@ class SteeringModelV2(nn.Module):
         # LSTM takes the 1280-d feature sequence
         self.lstm = nn.LSTM(input_size=1280, hidden_size=256, num_layers=1, batch_first=True)
 
-        # -- Output head: 3 regression values
+        # -- Output head: 4 regression values
         self.head = nn.Sequential(
             nn.Dropout(p=0.3),
-            nn.Linear(256, 128),
+            nn.Linear(256 + 1, 128),  # +1 for condition
             nn.SiLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(128, 3)   # [steering, scaled_speed, lateral_offset]
+            nn.Linear(128, 4)   # [steering, scaled_speed, lateral_offset, intersection]
         )
 
-    def forward(self, x):
-        # x shape: (B, 5, 3, H, W)
+    def forward(self, x, condition):
+        # x shape: (B, 10, 3, H, W), condition shape: (B, 1)
         B, seq_len, C, H, W = x.size()
         
         # Merge batch and sequence dims for backbone
@@ -366,6 +387,9 @@ class SteeringModelV2(nn.Module):
         # Use the last hidden state representing the end of the sequence
         # hn shape is (num_layers, B, hidden_size) -> (1, B, 256)
         last_hidden = hn[-1]  # (B, 256)
+        
+        # Concatenate condition
+        last_hidden = torch.cat((last_hidden, condition), dim=1) # (B, 257)
         
         return self.head(last_hidden)
 
@@ -433,17 +457,23 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,} total | {trainable_params:,} trainable")
 
-    # -- Loss: 3-way weighted Huber
-    steer_weight  = 0.70
+    # -- Loss: 4-way weighted Huber
+    steer_weight  = 0.55
     speed_weight  = 0.15
     offset_weight = 0.15
+    intersection_weight = 0.15
     _huber = nn.SmoothL1Loss(reduction='mean')
+    _bce = nn.BCEWithLogitsLoss(reduction='mean') # For intersection
 
     def criterion(outputs, labels):
         s_l = _huber(outputs[:, 0], labels[:, 0])
         v_l = _huber(outputs[:, 1], labels[:, 1])
         o_l = _huber(outputs[:, 2], labels[:, 2])
-        return steer_weight * s_l + speed_weight * v_l + offset_weight * o_l, s_l, v_l, o_l
+        # using BCEWithLogitsLoss since intersection is binary (0 or 1)
+        i_l = _bce(outputs[:, 3], labels[:, 3]) 
+        
+        total_loss = steer_weight * s_l + speed_weight * v_l + offset_weight * o_l + intersection_weight * i_l
+        return total_loss, s_l, v_l, o_l, i_l
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
@@ -453,7 +483,7 @@ def main():
     for epoch in range(epochs):
         # -- Train
         model.train()
-        t_loss = t_sl = t_vl = t_ol = 0.0
+        t_loss = t_sl = t_vl = t_ol = t_il = 0.0
 
         real_iter = iter(real_loader)
         diffused_iter = iter(diffused_loader)
@@ -470,17 +500,18 @@ def main():
             iterator, domain_name = active_iters[idx]
             
             try:
-                imgs, labels = next(iterator)
+                imgs, conditions, labels = next(iterator)
             except StopIteration:
                 active_iters.pop(idx)
                 continue
                 
-            imgs   = imgs.to(device)
-            labels = labels.to(device)
+            imgs       = imgs.to(device)
+            conditions = conditions.to(device)
+            labels     = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(imgs)
-            loss, s_l, v_l, o_l = criterion(outputs, labels)
+            outputs = model(imgs, conditions)
+            loss, s_l, v_l, o_l, i_l = criterion(outputs, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
@@ -490,45 +521,48 @@ def main():
             t_sl   += s_l.item()  * n
             t_vl   += v_l.item()  * n
             t_ol   += o_l.item()  * n
+            t_il   += i_l.item()  * n
             pbar.set_postfix({'loss': f"{loss.item():.3f}", 'st': f"{s_l.item():.3f}", 'dom': domain_name})
             pbar.update(1)
             
         pbar.close()
 
         N = len(real_train_dataset) + len(diffused_train_dataset)
-        t_loss /= N; t_sl /= N; t_vl /= N; t_ol /= N
+        t_loss /= N; t_sl /= N; t_vl /= N; t_ol /= N; t_il /= N
 
         # -- Validation
         model.eval()
-        v_loss = v_sl = v_vl = v_ol = 0.0
+        v_loss = v_sl = v_vl = v_ol = v_il = 0.0
 
         with torch.no_grad():
             pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
-            for imgs, labels in pbar_val:
-                imgs   = imgs.to(device)
-                labels = labels.to(device)
-                outputs              = model(imgs)
-                loss, s_l, v_l, o_l = criterion(outputs, labels)
+            for imgs, conditions, labels in pbar_val:
+                imgs       = imgs.to(device)
+                conditions = conditions.to(device)
+                labels     = labels.to(device)
+                outputs    = model(imgs, conditions)
+                loss, s_l, v_l, o_l, i_l = criterion(outputs, labels)
                 n      = imgs.size(0)
                 v_loss += loss.item() * n
                 v_sl   += s_l.item()  * n
                 v_vl   += v_l.item()  * n
                 v_ol   += o_l.item()  * n
+                v_il   += i_l.item()  * n
 
         Nv     = len(val_dataset)
-        v_loss /= Nv; v_sl /= Nv; v_vl /= Nv; v_ol /= Nv
+        v_loss /= Nv; v_sl /= Nv; v_vl /= Nv; v_ol /= Nv; v_il /= Nv
 
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{epochs} | "
-              f"Train={t_loss:.4f} (st={t_sl:.4f} sp={t_vl:.4f} of={t_ol:.4f}) | "
-              f"Val={v_loss:.4f} (st={v_sl:.4f} sp={v_vl:.4f} of={v_ol:.4f}) | "
+              f"Train={t_loss:.4f} (st={t_sl:.4f} sp={t_vl:.4f} of={t_ol:.4f} it={t_il:.4f}) | "
+              f"Val={v_loss:.4f} (st={v_sl:.4f} sp={v_vl:.4f} of={v_ol:.4f} it={v_il:.4f}) | "
               f"LR={current_lr:.2e}")
 
         wandb.log({
             "Train Loss": t_loss, "Train Steer Loss": t_sl,
-            "Train Speed Loss": t_vl, "Train Offset Loss": t_ol,
+            "Train Speed Loss": t_vl, "Train Offset Loss": t_ol, "Train Intersect Loss": t_il,
             "Val Loss": v_loss, "Val Steer Loss": v_sl,
-            "Val Speed Loss": v_vl, "Val Offset Loss": v_ol,
+            "Val Speed Loss": v_vl, "Val Offset Loss": v_ol, "Val Intersect Loss": v_il,
             "Learning Rate": current_lr, "epoch": epoch + 1
         })
 
@@ -538,14 +572,15 @@ def main():
             best_val_loss = v_loss
             torch.save(model.state_dict(), 'best_steering_v2_model.pth')
             meta = {
-                "max_speed": train_dataset.max_speed,
+                "max_speed": base_train_dataset.max_speed,
                 "version": "2_lstm",
-                "seq_len": 5,
-                "outputs": ["steering", "scaled_speed", "lateral_offset"]
+                "seq_len": 10,
+                "outputs": ["steering", "scaled_speed", "lateral_offset", "intersection"],
+                "inputs": ["images", "condition"]
             }
             with open('best_steering_v2_model_meta.json', 'w') as mf:
                 json.dump(meta, mf, indent=2)
-            print(f"--> Saved best V2 model  Val Loss={v_loss:.4f}  max_speed={train_dataset.max_speed:.4f}")
+            print(f"--> Saved best V2 model  Val Loss={v_loss:.4f}  max_speed={base_train_dataset.max_speed:.4f}")
 
     wandb.finish()
 

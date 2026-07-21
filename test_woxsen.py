@@ -306,13 +306,33 @@ def main():
                                      daemon=True)
     worker_thread.start()
 
-    video_path = "woxsen.mp4"
+    video_path = r"dataset\img_diffused"
     if not os.path.exists(video_path):
-        print(f"Error: Video not found at {video_path}")
+        print(f"Error: Path not found at {video_path}")
         sys.exit(1)
 
-    print(f"Opening video {video_path}...")
-    cap = cv2.VideoCapture(video_path)
+    print(f"Opening {video_path}...")
+    if os.path.isdir(video_path):
+        class ImageSeqCapture:
+            def __init__(self, d):
+                self.images = sorted([os.path.join(d, f) for f in os.listdir(d) if f.endswith(('.jpg', '.png'))])
+                self.idx = 0
+            def isOpened(self): return True
+            def read(self):
+                if self.idx < len(self.images):
+                    img = cv2.imread(self.images[self.idx])
+                    self.idx += 1
+                    return True, img
+                return False, None
+            def release(self): pass
+            def get(self, prop):
+                if prop == cv2.CAP_PROP_FRAME_COUNT:
+                    return len(self.images)
+                return 0
+        cap = ImageSeqCapture(video_path)
+    else:
+        cap = cv2.VideoCapture(video_path)
+    
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Total video frames: {total_frames}")
 

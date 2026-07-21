@@ -69,8 +69,11 @@ def main():
     script_dir = Path(__file__).resolve().parent
     workspace_dir = script_dir
     
-    SRC_DIR = workspace_dir / "dataset" / "img"
-    OUT_DIR = workspace_dir / "dataset" / "img_diffused"
+    # Accept dataset dir from command line args if provided
+    dataset_name = sys.argv[1] if len(sys.argv) > 1 else "dataset"
+    
+    SRC_DIR = workspace_dir / dataset_name / "img"
+    OUT_DIR = workspace_dir / dataset_name / "img_diffused"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     all_images = sorted([f for f in SRC_DIR.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
@@ -121,9 +124,12 @@ def main():
     errors = 0
     generated = 0
 
-    # Process in batches of 2
+    # Process in batches
     num_batches = math.ceil(len(to_process) / BATCH_SIZE)
     pbar = tqdm(range(num_batches), desc="Generating", unit="batch")
+
+    cv2.namedWindow("Diffusion Progress", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Diffusion Progress", 400, 150)
 
     for i in pbar:
         batch_files = to_process[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
@@ -201,6 +207,19 @@ def main():
                 }
                 generated += 1
                 
+            # Update progress window
+            progress_pct = (i + 1) / num_batches
+            prog_img = np.zeros((150, 400, 3), dtype=np.uint8)
+            cv2.putText(prog_img, f"Diffusing: {generated}/{len(to_process)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.rectangle(prog_img, (20, 70), (380, 100), (100, 100, 100), 2)
+            cv2.rectangle(prog_img, (20, 70), (20 + int(360 * progress_pct), 100), (0, 255, 100), -1)
+            time_elapsed = time.time() - start_time
+            time_per_batch = time_elapsed / (i + 1)
+            eta = time_per_batch * (num_batches - (i + 1))
+            cv2.putText(prog_img, f"ETA: {eta/60:.1f}m", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.imshow("Diffusion Progress", prog_img)
+            cv2.waitKey(1)
+
             # Save log periodically
             with open(LOG_FILE, "w") as f:
                 json.dump(log, f, indent=4)
