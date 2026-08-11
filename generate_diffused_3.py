@@ -22,7 +22,7 @@ if sys.platform == "win32":
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 LOG_FILE = "diffused_3_log.json"
-BATCH_SIZE = 3  # We want 1 prompt applied to 3 images
+BATCH_SIZE = 6  # Increased from 3 for better GPU utilisation (reduce if OOM)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD PIPELINE (Realistic Vision + LCM + Canny)
@@ -58,6 +58,11 @@ def load_controlnet_pipeline(workspace_dir: Path):
 
     pipe.to("cuda")
     # pipe.enable_attention_slicing() # Removed to speed up generation!
+    try:
+        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead")
+        print("   [OK] UNet compiled with torch.compile (reduce-overhead)")
+    except Exception as e:
+        print(f"   [!] torch.compile failed ({e}), continuing in eager mode")
     pipe.set_progress_bar_config(disable=True)
     print(f"   [OK] ControlNet pipeline ready\n")
     return pipe
@@ -65,15 +70,25 @@ def load_controlnet_pipeline(workspace_dir: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+import argparse
+
 def main():
     script_dir = Path(__file__).resolve().parent
     workspace_dir = script_dir
     
-    # Accept dataset dir from command line args if provided
-    dataset_name = sys.argv[1] if len(sys.argv) > 1 else "dataset"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", default=None, help="Source directory containing images")
+    parser.add_argument("--dst", default=None, help="Output directory for diffused images")
+    parser.add_argument("dataset_name", nargs="?", default="dataset", help="Dataset name (legacy mode)")
+    args = parser.parse_args()
     
-    SRC_DIR = workspace_dir / dataset_name / "img"
-    OUT_DIR = workspace_dir / dataset_name / "img_diffused"
+    if args.src and args.dst:
+        SRC_DIR = Path(args.src)
+        OUT_DIR = Path(args.dst)
+    else:
+        SRC_DIR = workspace_dir / args.dataset_name / "img"
+        OUT_DIR = workspace_dir / args.dataset_name / "img_diffused"
+        
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     all_images = sorted([f for f in SRC_DIR.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
@@ -161,8 +176,9 @@ def main():
             img_resized = cv2.resize(img_rgb, (512, 512))
             base_images.append(Image.fromarray(img_resized))
             
-            # Apply Gaussian Blur (3x3 kernel) before Canny
-            img_blurred = cv2.GaussianBlur(img_resized, (3, 3), 0)
+            # Apply Gaussian Blur (3x3 kernel) before Canny — work on grayscale directly
+            img_gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+            img_blurred = cv2.GaussianBlur(img_gray, (3, 3), 0)
             edges = cv2.Canny(img_blurred, 100, 200)
             edges = np.stack([edges, edges, edges], axis=-1)
             canny_images.append(Image.fromarray(edges))
@@ -172,7 +188,7 @@ def main():
             
         # 3. Diffusion setup
         seed = 8675309
-        generators = [torch.Generator(device="cpu").manual_seed(seed) for _ in range(len(batch_files))]
+        generators = [torch.Generator(device="cuda").manual_seed(seed) for _ in range(len(batch_files))]
         
         batch_prompts = [pos_prompt] * len(canny_images)
         batch_neg_prompts = [neg_prompt] * len(canny_images)
@@ -197,7 +213,7 @@ def main():
                 res_img_resized = cv2.resize(res_img_bgr, orig_size)
                 
                 out_path = OUT_DIR / img_path.name
-                cv2.imwrite(str(out_path), res_img_resized)
+                cv2.imwrite(str(out_path), res_img_resized, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 
                 log[img_path.name] = {
                     "scenario": scenario,
@@ -220,9 +236,10 @@ def main():
             cv2.imshow("Diffusion Progress", prog_img)
             cv2.waitKey(1)
 
-            # Save log periodically
-            with open(LOG_FILE, "w") as f:
-                json.dump(log, f, indent=4)
+            # Save log every 10 batches (images on disk are the real resume marker)
+            if (i + 1) % 10 == 0 or (i + 1) == num_batches:
+                with open(LOG_FILE, "w") as f:
+                    json.dump(log, f)
                 
         except Exception as e:
             errors += 1
